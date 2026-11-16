@@ -301,20 +301,23 @@ class MooncakeTeTransferChannelServer(TransferChannelServer):
         self._thread.start()
 
     def _serve_loop(self) -> None:
-        poller = zmq.Poller()
-        poller.register(self._socket, zmq.POLLIN)
-        while self._running:
-            try:
-                events = dict(poller.poll(timeout=1000))  # ms
-                if self._socket not in events:
-                    continue
-                req_bytes = self._socket.recv()
-                req = msgspec.msgpack.decode(req_bytes, type=HandshakeMsg)
-                resp = self._handle_msg(req)
-                self._socket.send(msgspec.msgpack.encode(resp))
-            except Exception:  # noqa: BLE001
-                if self._running:
-                    logger.exception("Error in transfer channel server loop")
+        try:
+            poller = zmq.Poller()
+            poller.register(self._socket, zmq.POLLIN)
+            while self._running:
+                try:
+                    events = dict(poller.poll(timeout=1000))  # ms
+                    if self._socket not in events:
+                        continue
+                    req_bytes = self._socket.recv()
+                    req = msgspec.msgpack.decode(req_bytes, type=HandshakeMsg)
+                    resp = self._handle_msg(req)
+                    self._socket.send(msgspec.msgpack.encode(resp))
+                except Exception:  # noqa: BLE001
+                    if self._running:
+                        logger.exception("Error in transfer channel server loop")
+        finally:
+            self._socket.close(linger=0)
 
     def _handle_msg(self, req: HandshakeMsg) -> HandshakeMsg:
         if isinstance(req, InitReq):
@@ -348,9 +351,7 @@ class MooncakeTeTransferChannelServer(TransferChannelServer):
         """
         self._running = False
         if self._thread.is_alive():
-            self._thread.join(timeout=5)
-        self._socket.close(linger=0)
-
+            self._thread.join()
 
 ############################################################
 # Context
