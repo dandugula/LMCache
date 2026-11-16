@@ -23,6 +23,7 @@ an existing context's connected clients short of closing it.
 from unittest.mock import MagicMock
 import itertools
 import time
+import threading
 
 # Third Party
 import pytest
@@ -328,6 +329,67 @@ def test_server_is_available_from_context(shared_contexts):
     ctx_a, _, _, _ = shared_contexts
     assert ctx_a.get_transfer_channel_server() is not None
 
+def test_server_thread_closes_its_socket_on_shutdown(monkeypatch: pytest.MonkeyPatch):
+    """The server thread, not the caller of close(), owns its ZMQ socket."""
+    from lmcache.v1.distributed.transfer_channel.impl import nixl_impl
+
+    poll_entered = threading.Event()
+    release_poll = threading.Event()
+    close_calls: list[int] = []
+
+    class FakeSocket:
+        def close(self, linger: int = 0) -> None:
+            close_calls.append(threading.get_ident())
+
+    class FakePoller:
+        def register(self, socket: FakeSocket, event: int) -> None:
+            pass
+
+        def poll(self, timeout: int) -> list[tuple[FakeSocket, int]]:
+            poll_entered.set()
+            release_poll.wait()
+            return []
+
+    monkeypatch.setattr(nixl_impl.zmq, "Poller", FakePoller)
+
+    server = nixl_impl.NixlTransferChannelServer.__new__(
+        nixl_impl.NixlTransferChannelServer
+    )
+    server._running = True
+    server._socket = FakeSocket()
+    server._thread = threading.Thread(target=server._serve_loop, daemon=True)
+    server._thread.start()
+
+    shutdown_started = threading.Event()
+
+    def shutdown() -> None:
+        shutdown_started.set()
+        server.close()
+
+    shutdown_thread = threading.Thread(target=shutdown)
+    shutdown_thread.start()
+
+    try:
+        assert poll_entered.wait(timeout=2)
+        assert shutdown_started.wait(timeout=2)
+
+        # Wait until close() has signaled the serve loop to stop. The poll is
+        # deliberately still blocked, so the server thread has not exited.
+        deadline = time.monotonic() + 2
+        while server._running and time.monotonic() < deadline:
+            time.sleep(0.001)
+        assert server._running is False
+        assert close_calls == []
+
+        release_poll.set()
+        shutdown_thread.join(timeout=2)
+
+        assert not shutdown_thread.is_alive()
+        assert close_calls == [server._thread.ident]
+    finally:
+        release_poll.set()
+        shutdown_thread.join(timeout=2)
+        server._thread.join(timeout=2)
 
 # =========================================================
 # Extra memory regions
